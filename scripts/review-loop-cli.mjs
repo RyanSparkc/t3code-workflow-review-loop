@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
@@ -9,7 +10,8 @@ import { parseArgs } from "node:util";
 const WINDOWS = process.platform === "win32";
 const WORKFLOW = "review-loop";
 const HELP = [
-  "Usage: node scripts/review-loop-cli.mjs <command> [options]",
+  "Usage: review-loop <command> [options]",
+  "       node scripts/review-loop-cli.mjs <command> [options]",
   "",
   "  start       Start a review with a new key or return an existing run for --key.",
   "  list        List workflow runs.",

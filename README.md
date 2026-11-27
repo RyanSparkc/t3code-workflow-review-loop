@@ -82,15 +82,37 @@ If you use a custom `T3CODE_WORKFLOWS` directory, copy the file there instead. I
 
 ### 3. Verify T3 loaded it
 
-Open **Open workflows → Definitions** in T3 Code and confirm `review-loop` is listed, or check from your terminal:
+Open **Open workflows → Definitions** in T3 Code and confirm `review-loop` is listed. To see past and active runs from your terminal, use:
 
 ```sh
 node ./scripts/review-loop-cli.mjs list
 ```
 
+### Optional CLI installation
+
+From this repository's root, pack the current version and install the archive with npm:
+
+```sh
+npm pack
+npm install --global ./t3code-workflow-review-loop-0.3.0.tgz
+review-loop --help
+```
+
+Use the filename printed by `npm pack` if it differs. The installed command is available wherever the npm global bin directory is on `PATH`. Run it from your target repository with `--project .`, or give an absolute project path. Updating the npm command and copying a workflow definition into T3 are separate steps.
+
+```sh
+review-loop start --project . --task-file task.md --test "npm test"
+```
+
+Use `--task-file` for multiline tasks or text with shell metacharacters, especially in Windows Command Prompt. For complex `--test` shell commands on Windows, use PowerShell or the direct Node launcher. If PowerShell blocks npm's `.ps1` launcher, use the direct Node launcher or `review-loop.cmd` with `--task-file` and a simple test command.
+
+### Optional agent Skill
+
+To hand off an agreed task from a chat, add [the `review-loop` Skill](skills/review-loop/SKILL.md) to a location your agent loads. In that chat, ask the agent to use the `review-loop` Skill to start the workflow. The Skill confirms the project root, branch, task, and test command, then returns the run ID. You can answer the final merge question in T3's **Workflows** view. Skill discovery and shortcut syntax depend on your agent.
+
 ## Common usage
 
-Run the launcher from this repository, or pass its full path from inside your target project with `--project .`.
+Run the launcher from this repository, or pass its full path from inside your target project with `--project .`. If you installed the CLI, the `review-loop` command takes the same arguments.
 
 ### Start a standard run
 
@@ -175,7 +197,7 @@ The launcher searches `PATH` and T3's standard install directories. On Windows, 
 
 | Platform | Evidence for this version |
 | --- | --- |
-| Windows | All 31 local tests pass, including review integrity checks for Git metadata and a linked hook target, verification failures, ref-transaction merges, and merge retries. A live Claude and Antigravity run on T3 v0.1.12 before the final v0.2.0 review fixes also verified a dirty-checkout refusal and a successful CLI retry. |
+| Windows | All 31 local tests pass, including review integrity checks for Git metadata and a linked hook target, verification failures, ref-transaction merges, and merge retries. The npm archive was installed and tested in PowerShell and Command Prompt with UTF-8 task text containing shell metacharacters. The installed CLI could list runs on T3. A live Claude and Antigravity run on T3 v0.1.12 before the final v0.2.0 review fixes also verified a dirty-checkout refusal and a successful CLI retry. |
 | macOS and Linux | Uses T3's installed executable or launcher and POSIX process-group cleanup on test timeout. Live testing on macOS and Linux is still pending. |
 
 Run `npm test` or `node --test` to run the local test suite. The suite executes real Git operations in temporary repositories with simulated T3 workflow primitives and model replies. Because it mocks T3's `Schema` and runtime, always confirm the workflow loads in T3 after modifying `workflows/review-loop.js`.

@@ -82,15 +82,37 @@ const AGENTS = {
 
 ### 3. 確認載入成功
 
-在 T3 Code 打開 **Open workflows → Definitions** 確認已出現 `review-loop`，或在終端機確認啟動器連得上 T3 伺服器：
+在 T3 Code 打開 **Open workflows → Definitions** 確認已出現 `review-loop`。要從終端機查看目前與過去的 run，可執行：
 
 ```sh
 node ./scripts/review-loop-cli.mjs list
 ```
 
+### 選用 CLI 安裝（Optional CLI installation）
+
+在這個 repo 的根目錄打包，再用 npm 安裝產生的壓縮檔：
+
+```sh
+npm pack
+npm install --global ./t3code-workflow-review-loop-0.3.0.tgz
+review-loop --help
+```
+
+如果 `npm pack` 印出的檔名不同，請以實際檔名為準。只要 npm 的全域執行檔目錄在 `PATH` 裡，就可以直接使用 `review-loop`。在目標 repo 根目錄執行時請帶 `--project .`，也可以指定絕對路徑。更新 npm 指令和複製 workflow 定義到 T3 是兩個步驟。
+
+```sh
+review-loop start --project . --task-file task.md --test "npm test"
+```
+
+多行需求或含有 shell 特殊字元的內容請用 `--task-file`，尤其是在 Windows 命令提示字元中。`--test` 若是複雜的 shell 指令，請用 PowerShell 或直接用 Node 啟動器。如果 PowerShell 的執行原則擋住 npm 產生的 `.ps1`，可用 Node 啟動器，或用 `review-loop.cmd` 搭配 `--task-file` 和簡單的測試指令。
+
+### 選用 Agent Skill
+
+要從聊天室交辦已談妥的需求，將 [`review-loop` Skill](skills/review-loop/SKILL.md) 加到你的 Agent 會讀取的位置。在對話中請 Agent 使用 `review-loop` Skill 啟動流程。它會確認專案根目錄、分支、任務和測試指令，再回報 run ID。最後可在 T3 的 **Workflows** 畫面決定是否合併。Skill 的載入位置與呼叫語法依 Agent 而定。
+
 ## 常用啟動方式
 
-你可以直接從這個 repo 的根目錄執行啟動器，或是切到目標專案目錄後用啟動器的完整路徑搭配 `--project .`。
+你可以從這個 repo 的根目錄執行啟動器，或切到目標專案根目錄後用啟動器的完整路徑搭配 `--project .`。若已安裝全域 CLI，`review-loop` 可接受相同參數。
 
 ### 一般啟動
 
@@ -175,7 +197,7 @@ node ./scripts/review-loop-cli.mjs leave --run RUN_ID
 
 | 平台 | 本版驗證紀錄 |
 | --- | --- |
-| Windows | 本機 31 項測試全部通過，涵蓋 Git 中繼資料與連結 hook 目標的審查比對、驗證失敗、ref transaction 合併與重試。v0.2.0 最後一輪審查修正前，曾在 T3 v0.1.12 用 Claude 和 Antigravity 實測，確認有未提交修改時會拒絕合併，修好 checkout 後可用同一條 CLI 指令重試成功。 |
+| Windows | 本機 31 項測試全部通過，涵蓋 Git 中繼資料與連結 hook 目標的審查比對、驗證失敗、ref transaction 合併與重試。npm 套件已在 PowerShell 與命令提示字元測試，能傳遞含 shell 特殊字元的 UTF-8 任務檔。安裝後的 CLI 也能列出 T3 的 run。v0.2.0 最後一輪審查修正前，曾在 T3 v0.1.12 用 Claude 和 Antigravity 實測，確認有未提交修改時會拒絕合併，修好 checkout 後可用同一條 CLI 指令重試成功。 |
 | macOS 與 Linux | 啟動器支援 T3 執行檔與安裝 launcher，測試逾時以 POSIX 行程群組清理。尚待在 macOS 與 Linux 實機驗證。 |
 
 執行 `npm test` 或 `node --test` 可跑本機測試套件。測試會在臨時 repo 執行真正的 Git 操作，但以替代品模擬 T3 與 `Schema` 及模型輸出；修改 `workflows/review-loop.js` 後請實際載入 T3 確認。
