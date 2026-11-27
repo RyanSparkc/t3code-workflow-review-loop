@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { findT3, invocation, isDirectExecution, launch } from "../scripts/review-loop-cli.mjs";
+import { findT3, invocation, isDirectExecution, launch, resolveMergeSignal, signalArgs } from "../scripts/review-loop-cli.mjs";
 
 const source = await readFile(new URL("../workflows/review-loop.js", import.meta.url), "utf8");
 const buildOutput = { summary: "Updated answer", testCommandRun: "none", testsPassed: true };
@@ -324,7 +324,7 @@ test("a checkout switch at the final write boundary cannot merge into another br
   try {
     const { result } = await evaluate(workflow, { project, task: "Update answer" }, {
       agent: (event) => event.name === "build" ? build(event) : { value: accepted },
-      ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+      ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
     });
     assert.equal(switched, true);
     assert.equal(result.merged, false);
@@ -365,7 +365,7 @@ test("advancing the target immediately before the ref transaction leaves its new
 
   const { result } = await evaluate(workflow, { project, task: "Update answer" }, {
     agent: (event) => event.name === "build" ? build(event) : { value: accepted },
-    ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+    ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
   });
   assert.ok(newTarget);
   assert.notEqual(newTarget, base);
@@ -394,7 +394,7 @@ test("a ref transaction that exits without committing restores the target checko
 
   const { result } = await evaluate(workflow, { project, task: "Update answer" }, {
     agent: (event) => event.name === "build" ? build(event) : { value: accepted },
-    ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+    ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
   });
   assert.equal(abortSent, true);
   assert.equal(result.merged, false);
@@ -419,7 +419,7 @@ test("a merge that would replace an ignored local file leaves the checkout intac
       git(checkout, "commit", "-m", "Track output");
       return built;
     },
-    ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+    ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
   });
   assert.equal(result.merged, false);
   assert.equal(git(project, "rev-parse", "main"), base);
@@ -445,7 +445,7 @@ async function mergeWithAddedFiles(t, setupLocal, files) {
       git(checkout, "commit", "-m", "Add files");
       return built;
     },
-    ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+    ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
   });
   return { project, base, result };
 }
@@ -685,5 +685,288 @@ test("reviewers option runs only selected agents and validates invalid selection
     project, task: "Update answer", builder: "claude", reviewers: [],
   }, {});
   assert.match(empty.result.stopped, /Choose 1 or 2 reviewers/);
+});
+
+// ---- v0.2.0 tests: E (merge retry + CLI), F (.git metadata snapshot), H (missing paths) ----
+
+test("E: retryable merge refusal prompts Retry merge and succeeds once checkout is fixed", async (t) => {
+  const { project, base, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  const asked = [];
+  const { result, events } = await evaluate(workflow, { project, task: "Update answer" }, {
+    agent: (event) => event.name === "build" ? build(event) : { value: accepted },
+    ask: async (event) => {
+      asked.push(event);
+      if (event.name === "approve-merge") {
+        // Dirty the target checkout before attempt 1 so merge is refused as retryable.
+        await writeFile(join(project, "answer.txt"), "dirty");
+        return { _tag: "Some", value: { choice: "Merge" } };
+      }
+      assert.equal(event.name, "approve-merge-2");
+      assert.deepEqual(event.options.choices, ["Retry merge", "Leave on branch"]);
+      assert.match(event.options.title, /uncommitted tracked changes/);
+      // Clean up the checkout before retrying.
+      git(project, "checkout", "--", "answer.txt");
+      return { _tag: "Some", value: { choice: "Retry merge" } };
+    },
+  });
+  assert.equal(result.merged, true, result.reason);
+  assert.equal(git(project, "show", "-s", "--format=%P", result.commit), base + " " + result.headSha);
+  assert.deepEqual(asked.map((e) => e.name), ["approve-merge", "approve-merge-2"]);
+  assert.deepEqual(
+    events.filter((e) => e.type === "step" && e.name.startsWith("local-merge")).map((e) => e.name),
+    ["local-merge", "local-merge-2"],
+  );
+});
+
+test("E: retryable merge stops after 3 attempts and non-retryable refusal does not re-ask", async (t) => {
+  // Case 1: exhausted 3 retryable merge attempts.
+  const first = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  const askNames1 = [];
+  const exhausted = await evaluate(workflow, { project: first.project, task: "Update answer" }, {
+    agent: (event) => event.name === "build" ? first.build(event) : { value: accepted },
+    ask: async (event) => {
+      askNames1.push(event.name);
+      await writeFile(join(first.project, "answer.txt"), "still-dirty");
+      return { _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Retry merge" } };
+    },
+  });
+  assert.equal(exhausted.result.merged, false);
+  assert.match(exhausted.result.reason, /merge retry limit reached/);
+  assert.deepEqual(askNames1, ["approve-merge", "approve-merge-2", "approve-merge-3"]);
+
+  // Case 2: non-retryable refusal (base branch moved) must NOT ask approve-merge-2.
+  const second = await repo(t);
+  const askNames2 = [];
+  const moved = await evaluate(workflow, { project: second.project, task: "Update answer" }, {
+    agent: (event) => event.name === "build" ? second.build(event) : { value: accepted },
+    ask: (event) => {
+      askNames2.push(event.name);
+      git(second.project, "commit", "--allow-empty", "-m", "Moved base");
+      return { _tag: "Some", value: { choice: "Merge" } };
+    },
+  });
+  assert.equal(moved.result.merged, false);
+  assert.match(moved.result.reason, /base branch moved/);
+  assert.match(moved.result.reason, /git merge --no-ff/);
+  assert.deepEqual(askNames2, ["approve-merge"]);
+});
+
+test("E: CLI resolveMergeSignal picks initial or retry question and rejects non-waiting runs", () => {
+  const initialShow = {
+    run: { runId: "r1", status: "waiting" },
+    steps: [{ name: "approve-merge", kind: "ask", status: "running" }],
+  };
+  assert.deepEqual(resolveMergeSignal(initialShow, "merge"), { wait: "approve-merge", choice: "Merge" });
+  assert.deepEqual(resolveMergeSignal(initialShow, "leave"), { wait: "approve-merge", choice: "Leave on branch" });
+
+  const retryShow = {
+    run: { runId: "r1", status: "waiting" },
+    steps: [
+      { name: "approve-merge", kind: "ask", status: "completed" },
+      { name: "local-merge", kind: "step", status: "completed" },
+      { name: "approve-merge-2", kind: "ask", status: "running" },
+    ],
+  };
+  assert.deepEqual(resolveMergeSignal(retryShow, "merge"), { wait: "approve-merge-2", choice: "Retry merge" });
+  assert.deepEqual(resolveMergeSignal(retryShow, "leave"), { wait: "approve-merge-2", choice: "Leave on branch" });
+  assert.deepEqual(signalArgs("merge", "r1", "approve-merge-2"), [
+    "workflow", "signal", '{"choice":"Retry merge"}', "--run", "r1", "--wait", "approve-merge-2",
+  ]);
+  assert.deepEqual(invocation(["merge", "--run", "r1", "--wait", "approve-merge-2"]).t3Args, [
+    "workflow", "signal", '{"choice":"Retry merge"}', "--run", "r1", "--wait", "approve-merge-2",
+  ]);
+
+  assert.throws(
+    () => resolveMergeSignal({ run: { runId: "r1", status: "completed" }, steps: [] }, "merge"),
+    /not waiting on a merge question/,
+  );
+});
+
+test("F: review stops when .git/config, hooks, or info/exclude change, but ignores refs/t3 checkpoints", async (t) => {
+  const { default: workflow } = await loadWorkflow();
+
+  // 1. .git/config tampered during review
+  const cfgRepo = await repo(t);
+  const cfgRes = await evaluate(workflow, { project: cfgRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return cfgRepo.build(event);
+      git(cfgRepo.project, "config", "core.autocrlf", "false");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when .git/config changes"),
+  });
+  assert.match(cfgRes.result.stopped, /Git metadata/);
+
+  // 2. .git/hooks tampered during review
+  const hookRepo = await repo(t);
+  const hookRes = await evaluate(workflow, { project: hookRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return hookRepo.build(event);
+      await fsPromises.mkdir(join(hookRepo.project, ".git", "hooks"), { recursive: true });
+      await writeFile(join(hookRepo.project, ".git", "hooks", "post-checkout"), "#!/bin/sh\necho tampered\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when .git/hooks changes"),
+  });
+  assert.match(hookRes.result.stopped, /Git metadata/);
+
+  // 3. .git/info/exclude tampered during review
+  const excludeRepo = await repo(t);
+  const excludeRes = await evaluate(workflow, { project: excludeRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return excludeRepo.build(event);
+      await writeFile(join(excludeRepo.project, ".git", "info", "exclude"), "secret-drop.txt\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when .git/info/exclude changes"),
+  });
+  assert.match(excludeRes.result.stopped, /Git metadata/);
+
+  // 4. Control: T3 checkpoint ref under refs/t3/ must NOT cause a false positive
+  const t3Repo = await repo(t);
+  const t3Res = await evaluate(workflow, { project: t3Repo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return t3Repo.build(event);
+      git(t3Repo.project, "update-ref", "refs/t3/orchestration-v2/checkpoints/test/ordinal/1", t3Repo.base);
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(t3Res.result.merged, false);
+  assert.equal(t3Res.result.reason, "Left on branch.");
+});
+
+test("H1: exhausting maxRounds without approval stops and preserves the branch", async (t) => {
+  const { project, checkout, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  const { result, events } = await evaluate(workflow, { project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") return build(event);
+      if (event.name === "revise-1") {
+        await writeFile(join(checkout, "answer.txt"), "still-wrong");
+        git(checkout, "commit", "-am", "Revise attempt 1");
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return { value: { approved: false, summary: "Still broken", problems: ["Fix answer.txt"] } };
+    },
+    ask: () => assert.fail("Must not ask merge when approval is never reached"),
+  });
+  assert.match(result.stopped, /No approval after 2 rounds/);
+  assert.deepEqual(events.filter((e) => e.type === "agent").map((e) => e.name), [
+    "build", "review-1-claude", "revise-1", "review-2-claude",
+  ]);
+});
+
+test("H2: verification failures (0 commits, dirty worktree, failing test) skip reviewers and return to builder", async (t) => {
+  const { default: workflow } = await loadWorkflow();
+
+  // Case a: 0 commits on build -> skips review-1 -> builder commits in revise-1 -> succeeds in round 2
+  const zeroRepo = await repo(t);
+  const zeroBriefs = [];
+  const zeroRes = await evaluate(workflow, { project: zeroRepo.project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        git(zeroRepo.project, "worktree", "add", "-b", event.options.workspace.branch, zeroRepo.checkout, "main");
+        return { thread: "original-builder", value: buildOutput };
+      }
+      if (event.name === "revise-1") {
+        zeroBriefs.push(event.options.brief);
+        await writeFile(join(zeroRepo.checkout, "answer.txt"), "2");
+        git(zeroRepo.checkout, "add", ".");
+        git(zeroRepo.checkout, "commit", "-m", "Commit on revise");
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(zeroRes.result.rounds, 2);
+  assert.match(zeroBriefs[0], /\[workflow\] Commit your changes/);
+  assert.equal(zeroRes.events.some((e) => e.type === "agent" && e.name.startsWith("review-1-")), false);
+
+  // Case b: dirty worktree + failing test command both skip reviewers
+  const failRepo = await repo(t);
+  let failBrief = "";
+  const failRes = await evaluate(workflow, {
+    project: failRepo.project,
+    task: "Update answer",
+    testCommand: 'node -e "console.error(\'boom\'); process.exit(1)"',
+    maxRounds: 2,
+  }, {
+    agent: async (event) => {
+      if (event.name === "build") return failRepo.build(event);
+      if (event.name === "revise-1") {
+        failBrief = event.options.brief;
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return assert.fail("Reviewers must be skipped when testCommand fails: " + event.name);
+    },
+    ask: () => assert.fail("Must not reach approve-merge while testCommand fails"),
+  });
+  assert.match(failBrief, /\[workflow\] Workflow test failed:/);
+  assert.match(failBrief, /boom/);
+  assert.match(failRes.result.stopped, /No approval after 2 rounds/);
+});
+
+test("H3: builder self-reported test failure skips reviewers unless testCommandRun is none", async (t) => {
+  const { default: workflow } = await loadWorkflow();
+
+  // Reported failing check with no fixed --test -> skips review-1 -> revises -> passes round 2
+  const r1 = await repo(t);
+  let reviseBrief = "";
+  const res1 = await evaluate(workflow, { project: r1.project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        await r1.build(event);
+        return { thread: "original-builder", value: { summary: "Failed locally", testCommandRun: "npm test", testsPassed: false } };
+      }
+      if (event.name === "revise-1") {
+        reviseBrief = event.options.brief;
+        return { thread: "original-builder", value: { summary: "Fixed", testCommandRun: "npm test", testsPassed: true } };
+      }
+      assert.equal(event.name, "review-2-claude");
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.match(reviseBrief, /\[builder\] Reported failing verification: npm test/);
+  assert.equal(res1.result.rounds, 2);
+
+  // testCommandRun: "none" with testsPassed: false does NOT skip reviewers
+  const r2 = await repo(t);
+  const res2 = await evaluate(workflow, { project: r2.project, task: "Update answer", maxRounds: 1 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        await r2.build(event);
+        return { thread: "original-builder", value: { summary: "No tests", testCommandRun: "none", testsPassed: false } };
+      }
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(res2.result.rounds, 1);
+  assert.equal(res2.events.some((e) => e.type === "agent" && e.name === "review-1-claude"), true);
+});
+
+test("H4: merge replay recovers an already-committed reviewed merge commit", async (t) => {
+  const { project, checkout, base, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  let precommitted = "";
+  const { result } = await evaluate(workflow, { project, task: "Update answer" }, {
+    agent: (event) => event.name === "build" ? build(event) : { value: accepted },
+    ask: () => {
+      // Simulate T3 crashing after the ref transaction already updated main to the exact merge commit.
+      const headSha = git(checkout, "rev-parse", "HEAD");
+      const tree = git(project, "rev-parse", headSha + "^{tree}");
+      precommitted = git(project, "commit-tree", tree, "-p", base, "-p", headSha, "-m", "Simulated prior merge");
+      git(project, "update-ref", "refs/heads/main", precommitted, base);
+      return { _tag: "Some", value: { choice: "Merge" } };
+    },
+  });
+  assert.ok(precommitted);
+  assert.equal(result.merged, true, result.reason);
+  assert.equal(result.commit, precommitted);
 });
 

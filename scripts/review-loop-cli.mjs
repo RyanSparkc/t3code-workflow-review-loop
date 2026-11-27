@@ -15,7 +15,7 @@ const HELP = [
   "  list        List workflow runs.",
   "  questions   List questions waiting for a reply.",
   "  show        Inspect a run; requires --run.",
-  "  merge       Approve a local merge; requires --run.",
+  "  merge       Approve or retry a local merge; requires --run.",
   "  leave       Keep the work on its branch; requires --run.",
   "",
   "Start options:",
@@ -29,6 +29,7 @@ const HELP = [
   "  --max-rounds N                    1 to 5 (default: 3).",
   "  --key KEY                         Stable key for retries (default: random).",
   "",
+  "Merge / leave options: --run ID, optional --wait NAME (default: auto-detect open question).",
   "Common options: --t3 FILE, --help. Use --json with start, list, questions, and show.",
   "Windows desktop fallback env vars: T3CODE_DESKTOP_EXE and T3CODE_DESKTOP_ENTRY.",
 ].join("\n");
@@ -44,9 +45,37 @@ const commands = new Map([
   ["list", { json }],
   ["questions", { json }],
   ["show", { json, run: string }],
-  ["merge", { run: string }],
-  ["leave", { run: string }],
+  ["merge", { run: string, wait: string }],
+  ["leave", { run: string, wait: string }],
 ]);
+
+export function signalArgs(command, runId, waitName = "approve-merge") {
+  const choice = command === "merge"
+    ? (waitName === "approve-merge" ? "Merge" : "Retry merge")
+    : "Leave on branch";
+  return ["workflow", "signal", JSON.stringify({ choice }), "--run", runId, "--wait", waitName];
+}
+
+export function resolveMergeSignal(showData, command) {
+  const steps = Array.isArray(showData?.steps) ? showData.steps : [];
+  const openAsk = [...steps].reverse().find((item) =>
+    item?.kind === "ask" &&
+    (item.status === "running" || item.status === "waiting") &&
+    /^approve-merge(?:-\d+)?$/.test(String(item.name || "")),
+  );
+  if (openAsk) {
+    const wait = String(openAsk.name);
+    const choice = command === "merge"
+      ? (wait === "approve-merge" ? "Merge" : "Retry merge")
+      : "Leave on branch";
+    return { wait, choice };
+  }
+  const status = showData?.run?.status || "unknown";
+  throw new Error(
+    "Run " + (showData?.run?.runId || "(unknown)") +
+    " is not waiting on a merge question (status: " + status + ").",
+  );
+}
 
 export function invocation(argv) {
   const [command, ...args] = argv;
@@ -56,6 +85,7 @@ export function invocation(argv) {
   if (values.help) return null;
 
   let t3Args = ["workflow", command];
+  let signal = null;
   if (command === "start") {
     if ((values.task === undefined) === (values["task-file"] === undefined)) {
       throw new Error("Provide exactly one of --task and --task-file.");
@@ -94,14 +124,17 @@ export function invocation(argv) {
     if (!runId || runId.startsWith("-")) throw new Error("--run must be a T3 workflow run ID.");
     if (command === "show") t3Args.push(runId);
     else {
-      const choice = command === "merge" ? "Merge" : "Leave on branch";
-      t3Args = [
-        "workflow", "signal", JSON.stringify({ choice }), "--run", runId, "--wait", "approve-merge",
-      ];
+      const wait = values.wait?.trim();
+      if (values.wait !== undefined && (!wait || wait.startsWith("-"))) {
+        throw new Error("--wait must be a T3 workflow question name.");
+      }
+      const waitName = wait || "approve-merge";
+      t3Args = signalArgs(command, runId, waitName);
+      signal = { command, runId, explicitWait: wait !== undefined };
     }
   }
   if (values.json) t3Args.push("--json");
-  return { t3Args, explicitPath: values.t3 };
+  return { t3Args, explicitPath: values.t3, signal };
 }
 
 function isExecutable(file) {
@@ -242,13 +275,42 @@ export function isDirectExecution(metaMain, argv1 = process.argv[1]) {
   return normalize(argv1) === normalize(fileURLToPath(import.meta.url));
 }
 
+async function capture(target, args) {
+  const child = launch(target, args, ["ignore", "pipe", "pipe"]);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode) => resolve(exitCode ?? 1));
+  });
+  if (code !== 0) {
+    throw new Error((stderr || stdout || "T3 CLI exited with " + code).trim());
+  }
+  return stdout;
+}
+
 async function main(argv) {
   const request = invocation(argv);
   if (!request) {
     process.stdout.write(HELP + "\n");
     return 0;
   }
-  const child = launch(findT3(request.explicitPath), request.t3Args);
+  const target = findT3(request.explicitPath);
+  let t3Args = request.t3Args;
+  if (request.signal && !request.signal.explicitWait) {
+    const raw = await capture(target, ["workflow", "show", request.signal.runId, "--json"]);
+    let showData;
+    try {
+      showData = JSON.parse(raw);
+    } catch {
+      throw new Error("Could not parse JSON from `t3 workflow show --json`. Pass --wait NAME explicitly.");
+    }
+    const resolved = resolveMergeSignal(showData, request.signal.command);
+    t3Args = signalArgs(request.signal.command, request.signal.runId, resolved.wait);
+  }
+  const child = launch(target, t3Args);
   return new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code) => resolve(code ?? 1));
