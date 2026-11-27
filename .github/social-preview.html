@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Social Preview</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --line: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #7ee787;
+    --build: #f0883e;
+    --review: #79c0ff;
+    --you: #d2a8ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    background:
+      radial-gradient(900px 420px at 92% -10%, rgba(121, 192, 255, 0.16), transparent 60%),
+      radial-gradient(700px 380px at -5% 110%, rgba(126, 231, 135, 0.12), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    padding: 72px 88px;
+    display: flex;
+    flex-direction: column;
+  }
+  .eyebrow {
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 26px;
+    color: var(--accent);
+    letter-spacing: 0.5px;
+  }
+  h1 {
+    margin-top: 14px;
+    font-size: 76px;
+    font-weight: 700;
+    line-height: 1.04;
+    letter-spacing: -1.5px;
+  }
+  .sub {
+    margin-top: 18px;
+    font-size: 30px;
+    color: var(--muted);
+    max-width: 1040px;
+    line-height: 1.35;
+  }
+  .flow {
+    margin-top: auto;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+  .node {
+    background: var(--panel);
+    border: 2px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 24px;
+    min-width: 0;
+  }
+  .node b { display: block; font-size: 28px; font-weight: 650; }
+  .node span { display: block; margin-top: 4px; font-size: 20px; color: var(--muted); }
+  .build { border-color: var(--build); }
+  .build b { color: var(--build); }
+  .verify { border-color: var(--accent); }
+  .verify b { color: var(--accent); }
+  .review { border-color: var(--review); }
+  .review b { color: var(--review); }
+  .you { border-color: var(--you); }
+  .you b { color: var(--you); }
+  .arrow { font-size: 34px; color: var(--muted); }
+  .models {
+    margin-top: 28px;
+    display: flex;
+    gap: 12px;
+    font-size: 21px;
+    color: var(--muted);
+    align-items: center;
+  }
+  .chip {
+    border: 1.5px solid var(--line);
+    border-radius: 999px;
+    padding: 5px 16px;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+  <div class="eyebrow">T3 Code Workflow</div>
+  <h1>Multi-Model Review Loop</h1>
+  <p class="sub">One model builds in a Git worktree. Others review the exact verified commit. You decide the merge.</p>
+
+  <div class="flow">
+    <div class="node build"><b>Build</b><span>isolated worktree</span></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node verify"><b>Verify</b><span>commit + tests</span></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node review"><b>Review</b><span>1&ndash;2 models, read-only</span></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node you"><b>You</b><span>merge or keep branch</span></div>
+  </div>
+
+  <div class="models">
+    <span>Mix any providers:</span>
+    <span class="chip">Claude</span>
+    <span class="chip">Codex</span>
+    <span class="chip">Gemini</span>
+    <span style="margin-left:auto;font-family:Consolas,monospace;">github.com/RyanSparkc/t3code-workflow-review-loop</span>
+  </div>
+</body>
+</html>
