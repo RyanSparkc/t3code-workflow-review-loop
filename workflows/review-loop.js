@@ -1,8 +1,8 @@
 // T3 Code Workflows (Labs). Configure the agent pool before installing this file.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, stat } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 // Fill in model slugs from T3 Settings → Providers. Keep at least two entries.
@@ -25,6 +25,7 @@ const REVIEW_FOCI = [
 ];
 const DEFAULT_BASE = "main";
 const DEFAULT_ROUNDS = 3;
+const MAX_MERGE_ATTEMPTS = 3;
 const GIT_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 const WINDOWS = process.platform === "win32";
@@ -62,6 +63,7 @@ const Review = Schema.Struct({
 });
 const Snapshot = Schema.Struct({
   checkout: Schema.String,
+  gitMeta: Schema.String,
   head: Schema.String,
   headRef: Schema.String,
   baseTip: Schema.String,
@@ -71,6 +73,7 @@ const Merge = Schema.Struct({
   merged: Schema.Boolean,
   commit: Schema.String,
   reason: Schema.String,
+  retryable: Schema.Boolean,
 });
 
 const promiseStep = (name, returns, run) =>
@@ -281,14 +284,106 @@ async function verify(project, base, branch, command) {
   return result;
 }
 
-// Compare status, index changes and worktree changes. Binary patches keep
-// a second edit to a dirty tracked file visible even if its status is unchanged.
+async function hashTargetEntry(hash, label, target, entry, seen) {
+  if (entry.isFile()) {
+    const bytes = await readFile(target);
+    hash.update(JSON.stringify([label, "file", entry.mode & 0o777, bytes.length]) + "\n");
+    hash.update(bytes);
+    hash.update("\n");
+    return;
+  }
+  if (entry.isDirectory()) {
+    const real = await realpath(target);
+    if (seen.has(real)) {
+      hash.update(JSON.stringify([label, "dir-cycle"]) + "\n");
+      return;
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(real);
+    hash.update(JSON.stringify([label, "dir", entry.mode & 0o777]) + "\n");
+    const children = (await readdir(target)).sort();
+    for (const child of children) {
+      await hashPathInto(hash, label + "/" + child, join(target, child), nextSeen);
+    }
+    return;
+  }
+  hash.update(JSON.stringify([label, "other", entry.mode]) + "\n");
+}
+
+async function hashPathInto(hash, label, target, seen = new Set()) {
+  const entry = await pathEntry(target);
+  if (!entry) {
+    hash.update(JSON.stringify([label, "missing"]) + "\n");
+    return;
+  }
+  if (entry.isSymbolicLink()) {
+    const link = await readlink(target);
+    hash.update(JSON.stringify([label, "symlink", link]) + "\n");
+    let resolvedStat;
+    try {
+      resolvedStat = await stat(target);
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "ELOOP") {
+        hash.update(JSON.stringify([label, "symlink-target", error.code]) + "\n");
+        return;
+      }
+      throw error;
+    }
+    const real = await realpath(target);
+    await hashTargetEntry(hash, label + "->target", real, resolvedStat, seen);
+    return;
+  }
+  await hashTargetEntry(hash, label, target, entry, seen);
+}
+
+async function gitConfigPath(project, key) {
+  try {
+    return await readGit(project, ["config", "--path", "--get", key]);
+  } catch (error) {
+    if (error.cause?.code === 1) return "";
+    throw error;
+  }
+}
+
+// Hash security-sensitive Git metadata (config, config.worktree, hooks, info/exclude, info/attributes)
+// without hashing .git/objects or refs/t3 where T3 writes its own checkpoints.
+async function hashGitMeta(project) {
+  const [rawGitDir, rawCommonDir, configuredHooks] = await Promise.all([
+    readGit(project, ["rev-parse", "--git-dir"]),
+    readGit(project, ["rev-parse", "--git-common-dir"]),
+    gitConfigPath(project, "core.hooksPath"),
+  ]);
+  const gitDir = resolve(project, rawGitDir);
+  const commonDir = resolve(project, rawCommonDir);
+  const hash = createHash("sha256");
+  await hashPathInto(hash, "common/config", join(commonDir, "config"));
+  await hashPathInto(hash, "common/info/exclude", join(commonDir, "info", "exclude"));
+  await hashPathInto(hash, "common/info/attributes", join(commonDir, "info", "attributes"));
+  await hashPathInto(hash, "common/hooks", join(commonDir, "hooks"));
+  await hashPathInto(hash, "worktree/config.worktree", join(gitDir, "config.worktree"));
+  if (configuredHooks) {
+    const hooksDir = isAbsolute(configuredHooks) ? configuredHooks : resolve(project, configuredHooks);
+    const defaultHooksDir = join(commonDir, "hooks");
+    const sameHooksDir = WINDOWS
+      ? hooksDir.toLowerCase() === defaultHooksDir.toLowerCase()
+      : hooksDir === defaultHooksDir;
+    hash.update(JSON.stringify(["configuredHooks", configuredHooks]) + "\n");
+    if (!sameHooksDir) {
+      await hashPathInto(hash, "configured-hooks", hooksDir);
+    }
+  }
+  return hash.digest("hex");
+}
+
+// Compare status, index changes, worktree changes, and Git config/hooks/info metadata.
+// Binary patches keep a second edit to a dirty tracked file visible even if status is unchanged.
 async function snapshot(project, base, branch) {
   const diff = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--full-index"];
-  const [status, staged, unstaged, head, headRef, baseTip, branchTip] = await Promise.all([
+  const [status, staged, unstaged, gitMeta, head, headRef, baseTip, branchTip] = await Promise.all([
     git(project, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     git(project, [...diff, "--cached", "--"]),
     git(project, [...diff, "--"]),
+    hashGitMeta(project),
     verifyRefIfPresent(project, "HEAD"),
     checkoutRef(project),
     verifyRefIfPresent(project, ref(base)),
@@ -296,13 +391,14 @@ async function snapshot(project, base, branch) {
   ]);
   return {
     checkout: createHash("sha256").update(JSON.stringify([status, staged, unstaged])).digest("hex"),
-    head, headRef, baseTip, branchTip,
+    gitMeta, head, headRef, baseTip, branchTip,
   };
 }
 
 function snapshotChanges(before, after) {
   const changes = [];
   if (before.checkout !== after.checkout) changes.push("files in the project checkout changed");
+  if (before.gitMeta !== after.gitMeta) changes.push("Git metadata (config, hooks, or info) changed");
   if (before.head !== after.head || before.headRef !== after.headRef) {
     changes.push("the project checkout HEAD moved");
   }
@@ -430,11 +526,11 @@ async function updateReviewedBranch(project, target, source, baseSha, headSha, c
 async function merge(project, base, branch, baseSha, headSha) {
   const target = ref(base);
   const source = ref(branch);
-  const refused = (reason) => ({ merged: false, commit: "", reason });
-  const success = (commit) => ({ merged: true, commit, reason: "Merged locally into " + base + "." });
+  const refused = (reason, retryable = true) => ({ merged: false, commit: "", reason, retryable });
+  const success = (commit) => ({ merged: true, commit, reason: "Merged locally into " + base + ".", retryable: false });
   try {
     if (await checkoutRef(project) !== target) {
-      return refused("Check out " + base + " in the selected project before merging.");
+      return refused("Check out " + base + " in the selected project before merging.", true);
     }
     const current = await branchSha(project, base);
     const tree = await readGit(project, ["rev-parse", headSha + "^{tree}"]);
@@ -443,17 +539,23 @@ async function merge(project, base, branch, baseSha, headSha) {
       if (await readGit(project, ["show", "-s", "--format=%T%n%P", current]) === tree + "\n" + baseSha + " " + headSha) {
         return success(current);
       }
-      return refused("The base branch moved after verification. Start a fresh review before merging.");
+      return refused(
+        "The base branch moved after verification. Start a fresh review before merging, or merge manually with: git merge --no-ff " + branch,
+        false,
+      );
     }
     if (await branchSha(project, branch) !== headSha) {
-      return refused("The source branch moved after verification. Start a fresh review before merging.");
+      return refused(
+        "The source branch moved after verification. Start a fresh review before merging, or inspect: git log " + base + ".." + branch,
+        false,
+      );
     }
     if (await readGit(project, ["status", "--porcelain", "--untracked-files=no"])) {
-      return refused("The target checkout has uncommitted tracked changes.");
+      return refused("The target checkout has uncommitted tracked changes.", true);
     }
     for (const operation of ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]) {
       if (await verifyRefIfPresent(project, operation)) {
-        return refused("Finish the existing Git operation before merging (" + operation + ").");
+        return refused("Finish the existing Git operation before merging (" + operation + ").", true);
       }
     }
 
@@ -467,7 +569,24 @@ async function merge(project, base, branch, baseSha, headSha) {
     await updateReviewedBranch(project, target, source, baseSha, headSha, commit, message);
     return success(commit);
   } catch (error) {
-    return refused(error.message);
+    let retryable = true;
+    let reason = error.message;
+    try {
+      const [baseNow, branchNow] = await Promise.all([
+        verifyRefIfPresent(project, target),
+        verifyRefIfPresent(project, source),
+      ]);
+      if (baseNow !== baseSha) {
+        retryable = false;
+        reason += " Start a fresh review before merging, or merge manually with: git merge --no-ff " + branch;
+      } else if (branchNow !== headSha) {
+        retryable = false;
+        reason += " Start a fresh review before merging, or inspect: git log " + base + ".." + branch;
+      }
+    } catch {
+      // Keep retryable=true if ref inspection itself failed.
+    }
+    return refused(reason, retryable);
   }
 }
 
@@ -479,7 +598,7 @@ function testInstruction(command) {
 
 export default workflow(
   "review-loop",
-  { version: 4, payload: Payload },
+  { version: 5, payload: Payload },
   Effect.fn(function* (input, run) {
     const project = input.project.trim();
     if (!isAbsolute(project) || !input.task.trim()) {
@@ -629,29 +748,55 @@ export default workflow(
       }
 
       if (problems.length === 0) {
-        const answer = yield* ask("approve-merge", {
-          title: "Approved in round " + round + ". Merge " + branch + " into " + base + "?",
-          choices: ["Merge", "Leave on branch"],
-          data: {
-            builder, project, base, branch,
-            baseSha: verified.baseSha,
-            headSha: verified.headSha,
-            summary: latest.summary,
-            testCommandRun: command || latest.testCommandRun,
-            deterministicTestRan: verified.testRan,
-            testOutputTail: verified.testOutputTail,
-            reviews: reviews.map(({ value }, index) => ({ reviewer: reviewers[index], summary: value.summary })),
-          },
-          timeout: "7 days",
-        });
-
         const result = { builder, project, base, branch, headSha: verified.headSha, rounds: round };
-        if (answer._tag !== "Some" || answer.value.choice !== "Merge") {
-          return { ...result, merged: false, commit: "", reason: "Left on branch." };
+        const mergeData = {
+          builder, project, base, branch,
+          baseSha: verified.baseSha,
+          headSha: verified.headSha,
+          summary: latest.summary,
+          testCommandRun: command || latest.testCommandRun,
+          deterministicTestRan: verified.testRan,
+          testOutputTail: verified.testOutputTail,
+          reviews: reviews.map(({ value }, index) => ({ reviewer: reviewers[index], summary: value.summary })),
+        };
+
+        let lastReason = "";
+        for (let attempt = 1; attempt <= MAX_MERGE_ATTEMPTS; attempt++) {
+          const waitName = attempt === 1 ? "approve-merge" : "approve-merge-" + attempt;
+          const mergeChoice = attempt === 1 ? "Merge" : "Retry merge";
+          const questionTitle = attempt === 1
+            ? "Approved in round " + round + ". Merge " + branch + " into " + base + "?"
+            : "Merge refused (attempt " + (attempt - 1) + "/" + MAX_MERGE_ATTEMPTS + "): " +
+              lastReason.replace(/\s+/g, " ").trim().slice(0, 140) + " Fix the checkout and retry?";
+          const answer = yield* ask(waitName, {
+            title: questionTitle,
+            choices: [mergeChoice, "Leave on branch"],
+            data: attempt === 1
+              ? mergeData
+              : { ...mergeData, lastMergeReason: lastReason, attempt, maxAttempts: MAX_MERGE_ATTEMPTS },
+            timeout: "7 days",
+          });
+
+          if (answer._tag !== "Some" || answer.value.choice !== mergeChoice) {
+            return {
+              ...result,
+              merged: false,
+              commit: "",
+              reason: attempt === 1 ? "Left on branch." : "Left on branch after merge refusal: " + lastReason,
+            };
+          }
+
+          const stepName = attempt === 1 ? "local-merge" : "local-merge-" + attempt;
+          const merged = yield* promiseStep(stepName, Merge,
+            () => merge(project, base, branch, verified.baseSha, verified.headSha));
+          if (merged.merged || !merged.retryable || attempt === MAX_MERGE_ATTEMPTS) {
+            const reason = !merged.merged && merged.retryable && attempt === MAX_MERGE_ATTEMPTS
+              ? merged.reason + " (merge retry limit reached; merge manually with: git merge --no-ff " + branch + ")"
+              : merged.reason;
+            return { ...result, merged: merged.merged, commit: merged.commit, reason };
+          }
+          lastReason = merged.reason;
         }
-        const merged = yield* promiseStep("local-merge", Merge,
-          () => merge(project, base, branch, verified.baseSha, verified.headSha));
-        return { ...result, ...merged };
       }
 
       if (round === rounds) break;
