@@ -1,7 +1,7 @@
 // T3 Code Workflows (Labs). Configure the agent pool before installing this file.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, readlink, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -284,17 +284,7 @@ async function verify(project, base, branch, command) {
   return result;
 }
 
-async function hashPathInto(hash, label, target) {
-  const entry = await pathEntry(target);
-  if (!entry) {
-    hash.update(JSON.stringify([label, "missing"]) + "\n");
-    return;
-  }
-  if (entry.isSymbolicLink()) {
-    const link = await readlink(target);
-    hash.update(JSON.stringify([label, "symlink", link]) + "\n");
-    return;
-  }
+async function hashTargetEntry(hash, label, target, entry, seen) {
   if (entry.isFile()) {
     const bytes = await readFile(target);
     hash.update(JSON.stringify([label, "file", entry.mode & 0o777, bytes.length]) + "\n");
@@ -303,14 +293,47 @@ async function hashPathInto(hash, label, target) {
     return;
   }
   if (entry.isDirectory()) {
+    const real = await realpath(target);
+    if (seen.has(real)) {
+      hash.update(JSON.stringify([label, "dir-cycle"]) + "\n");
+      return;
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(real);
     hash.update(JSON.stringify([label, "dir", entry.mode & 0o777]) + "\n");
     const children = (await readdir(target)).sort();
     for (const child of children) {
-      await hashPathInto(hash, label + "/" + child, join(target, child));
+      await hashPathInto(hash, label + "/" + child, join(target, child), nextSeen);
     }
     return;
   }
   hash.update(JSON.stringify([label, "other", entry.mode]) + "\n");
+}
+
+async function hashPathInto(hash, label, target, seen = new Set()) {
+  const entry = await pathEntry(target);
+  if (!entry) {
+    hash.update(JSON.stringify([label, "missing"]) + "\n");
+    return;
+  }
+  if (entry.isSymbolicLink()) {
+    const link = await readlink(target);
+    hash.update(JSON.stringify([label, "symlink", link]) + "\n");
+    let resolvedStat;
+    try {
+      resolvedStat = await stat(target);
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "ELOOP") {
+        hash.update(JSON.stringify([label, "symlink-target", error.code]) + "\n");
+        return;
+      }
+      throw error;
+    }
+    const real = await realpath(target);
+    await hashTargetEntry(hash, label + "->target", real, resolvedStat, seen);
+    return;
+  }
+  await hashTargetEntry(hash, label, target, entry, seen);
 }
 
 async function gitConfigPath(project, key) {
@@ -322,7 +345,7 @@ async function gitConfigPath(project, key) {
   }
 }
 
-// Hash security-sensitive Git metadata (config, hooks, info/exclude, info/attributes)
+// Hash security-sensitive Git metadata (config, config.worktree, hooks, info/exclude, info/attributes)
 // without hashing .git/objects or refs/t3 where T3 writes its own checkpoints.
 async function hashGitMeta(project) {
   const [rawGitDir, rawCommonDir, configuredHooks] = await Promise.all([
@@ -337,13 +360,15 @@ async function hashGitMeta(project) {
   await hashPathInto(hash, "common/info/exclude", join(commonDir, "info", "exclude"));
   await hashPathInto(hash, "common/info/attributes", join(commonDir, "info", "attributes"));
   await hashPathInto(hash, "common/hooks", join(commonDir, "hooks"));
-  if (gitDir !== commonDir) {
-    await hashPathInto(hash, "worktree/config.worktree", join(gitDir, "config.worktree"));
-  }
+  await hashPathInto(hash, "worktree/config.worktree", join(gitDir, "config.worktree"));
   if (configuredHooks) {
     const hooksDir = isAbsolute(configuredHooks) ? configuredHooks : resolve(project, configuredHooks);
+    const defaultHooksDir = join(commonDir, "hooks");
+    const sameHooksDir = WINDOWS
+      ? hooksDir.toLowerCase() === defaultHooksDir.toLowerCase()
+      : hooksDir === defaultHooksDir;
     hash.update(JSON.stringify(["configuredHooks", configuredHooks]) + "\n");
-    if (hooksDir !== join(commonDir, "hooks")) {
+    if (!sameHooksDir) {
       await hashPathInto(hash, "configured-hooks", hooksDir);
     }
   }
@@ -545,16 +570,23 @@ async function merge(project, base, branch, baseSha, headSha) {
     return success(commit);
   } catch (error) {
     let retryable = true;
+    let reason = error.message;
     try {
       const [baseNow, branchNow] = await Promise.all([
         verifyRefIfPresent(project, target),
         verifyRefIfPresent(project, source),
       ]);
-      if (baseNow !== baseSha || branchNow !== headSha) retryable = false;
+      if (baseNow !== baseSha) {
+        retryable = false;
+        reason += " Start a fresh review before merging, or merge manually with: git merge --no-ff " + branch;
+      } else if (branchNow !== headSha) {
+        retryable = false;
+        reason += " Start a fresh review before merging, or inspect: git log " + base + ".." + branch;
+      }
     } catch {
       // Keep retryable=true if ref inspection itself failed.
     }
-    return refused(error.message, retryable);
+    return refused(reason, retryable);
   }
 }
 
@@ -735,7 +767,7 @@ export default workflow(
           const questionTitle = attempt === 1
             ? "Approved in round " + round + ". Merge " + branch + " into " + base + "?"
             : "Merge refused (attempt " + (attempt - 1) + "/" + MAX_MERGE_ATTEMPTS + "): " +
-              lastReason.slice(0, 140) + " Fix the checkout and retry?";
+              lastReason.replace(/\s+/g, " ").trim().slice(0, 140) + " Fix the checkout and retry?";
           const answer = yield* ask(waitName, {
             title: questionTitle,
             choices: [mergeChoice, "Leave on branch"],

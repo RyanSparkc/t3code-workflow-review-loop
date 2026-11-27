@@ -139,7 +139,7 @@ node ./scripts/review-loop-cli.mjs merge --run RUN_ID
 node ./scripts/review-loop-cli.mjs leave --run RUN_ID
 ```
 
-選擇 `leave` 或七天內未回覆時，分支會保留下來，目標分支維持原樣。若本機合併因可修復的 checkout 狀態被拒（例如主目錄有未提交修改、停在別的分支、有進行中的 Git 操作，或本機檔案擋住新增路徑），workflow 會顯示原因並再問一次是否重試合併（最多共嘗試 3 次）。重試時一樣執行 `merge --run RUN_ID` 或 `leave --run RUN_ID`，啟動器會自動偵測目前開啟中的合併問題。若是來源或目標分支在審查後移動，則不重試、直接結束並附上建議的手動合併指令。
+選擇 `leave` 或七天內未回覆時，分支會保留下來，目標分支維持原樣。若本機合併因可修復的 checkout 狀態被拒（例如主目錄有未提交修改、停在別的分支、有進行中的 Git 操作，或本機檔案擋住新增路徑），workflow 會顯示原因並再問一次是否重試合併（最多共嘗試 3 次）。重試時一樣執行 `merge --run RUN_ID` 或 `leave --run RUN_ID`，啟動器會自動偵測目前開啟中的合併問題。若是來源或目標分支在審查後移動，則不重試並直接結束（目標分支移動時會附上 `git merge --no-ff` 指令，來源分支移動時會附上 `git log` 檢視指令）。
 
 ## 啟動器參數
 
@@ -154,6 +154,7 @@ node ./scripts/review-loop-cli.mjs leave --run RUN_ID
 | `--branch BRANCH` | 新建的 worktree 分支名稱，省略時自動產生。 |
 | `--max-rounds N` | 1 到 5 輪，預設 3 輪。驗證沒過會先退回 builder 修正，不浪費 reviewer。 |
 | `--key KEY` | 冪等鍵，重複使用同一個 key 會取回既有 run；省略時自動產生隨機 key。 |
+| `--wait NAME` | 選填，用於 `merge`／`leave`；預設會從 `show --json` 自動偵測進行中的問題名稱，若狀態查詢失敗可手動指定 `approve-merge` 或 `approve-merge-N`（例如 `approve-merge-2`）。 |
 | `--t3 FILE` | 自動偵測不到 T3 CLI 時手動指定路徑。Windows 支援原生 `t3.exe` 與 T3 產生的 `t3.cmd`。 |
 | `--json` | 讓 `start`、`list`、`show` 或 `questions` 輸出 JSON。 |
 
@@ -164,17 +165,17 @@ node ./scripts/review-loop-cli.mjs leave --run RUN_ID
 ## 安全機制與合併保護
 
 - **確定性驗證**：每輪 build 與 revise 結束後，程式會親自檢查分支是否有新 commit 且基於最新本地目標分支、worktree 沒有未提交的非忽略檔案，並在 worktree 執行 `--test`。測試逾時時，Windows 以 `taskkill /T /F` 清除整個子行程樹，macOS 與 Linux 則終止整個 POSIX 行程群組。
-- **審查寫入防護**：reviewer 會在專案 checkout 以 plan mode 開啟並收到唯讀指示。由於 plan mode 本身不是檔案系統沙盒，workflow 會在每次審查前後比對 Git 狀態、暫存與未暫存 diff、`.git/config`、`.git/hooks`（含設定的 `core.hooksPath`）、`.git/info/exclude`、`.git/info/attributes`、目前分支與 HEAD、以及來源和目標分支 SHA；只要偵測到任何變動（包含你在審查期間手動修改工作區），就會在詢問合併前直接停止。`.git/objects` 與 T3 自身寫入的 `.git/refs/t3` 不在比對範圍內，避免正常執行時誤判。原本就存在的未追蹤檔案內容與 Git 忽略檔案不在偵測範圍內。
+- **審查寫入防護**：reviewer 會在專案 checkout 以 plan mode 開啟並收到唯讀指示。由於 plan mode 本身不是檔案系統沙盒，workflow 會在每次審查前後比對 Git 狀態、暫存與未暫存 diff、儲存庫 Git 設定（含 `config.worktree`）、hooks（含設定的 `core.hooksPath` 與符號連結目標）、`.git/info/exclude`、`.git/info/attributes`、目前分支與 HEAD，以及來源和目標分支 SHA。只要偵測到變動（包含你在審查期間手動修改工作區），就會在詢問合併前停止。`.git/objects` 與 T3 寫入的 `.git/refs/t3` 不在比對範圍內，避免正常執行時誤判。原有未追蹤檔案與 Git 忽略檔案的內容不在比對範圍內。
 - **嚴格核准條件**：reviewer 必須同時回傳 `approved: true` 且 `problems` 為空陣列才算核准；只要列了任何問題，即使 `approved` 為 `true` 也會交回 builder 修正。空白項目會被忽略。
 - **只在受信任的環境使用 `--test`**：`--test` 會透過 T3 伺服器的 shell，以伺服器的權限執行。能啟動這個 workflow 的人都能在那台機器上執行指令，所以只適合用在你自己掌控的本機環境。
-- **原子本機合併與重試**：選擇 `merge` 時，專案 checkout 必須停在 `--base`、已追蹤檔案乾淨且沒有進行中的 Git 操作。流程會用 `git commit-tree` 對驗證過的檔案樹建立雙親 merge commit（沿用 Git commit 簽署設定），再透過 Git ref transaction 鎖定目標分支並重驗兩個 SHA 後更新 checkout 與分支。如果合併會在本機已存在的未追蹤或忽略檔案、資料夾位置新增檔案，就會拒絕合併。若是可修復的 checkout 狀態被拒，會再問一次 `Retry merge` 或 `Leave on branch`（最多 3 次）；若是審查後分支移動，則直接結束並附上手動合併指令。因為使用 `git commit-tree`，依賴一般 merge 或 commit hooks 的專案請改用 `leave` 後手動合併；若 T3 在更新中途異常中斷，重試前請先檢查 `git status`。
+- **原子本機合併與重試**：選擇 `merge` 時，專案 checkout 必須停在 `--base`、已追蹤檔案乾淨且沒有進行中的 Git 操作。流程會用 `git commit-tree` 對驗證過的檔案樹建立雙親 merge commit（沿用 Git commit 簽署設定），再透過 Git ref transaction 鎖定目標分支並重驗兩個 SHA 後更新 checkout 與分支。如果合併會在本機已存在的未追蹤或忽略檔案、資料夾位置新增檔案，就會拒絕合併。若是可修復的 checkout 狀態被拒，會再問一次 `Retry merge` 或 `Leave on branch`（最多 3 次）；若是審查後分支移動，則直接結束並附上 `git merge --no-ff`（目標分支移動）或 `git log`（來源分支移動）提示。因為使用 `git commit-tree`，依賴一般 merge 或 commit hooks 的專案請改用 `leave` 後手動合併；若 T3 在更新中途異常中斷，重試前請先檢查 `git status`。
 - **跑完後留下的 worktree**：不論是否合併，builder 的 worktree 和分支都會保留。不再需要時，用 `git worktree remove <路徑>` 和 `git branch -d <分支>` 清除，路徑可以用 `git worktree list` 查到。
 
 ## 平台驗證狀態
 
 | 平台 | 本版驗證紀錄 |
 | --- | --- |
-| Windows | 本機 31 項測試全部通過，涵蓋 Git worktree、ref transaction 合併、可重試合併與 CLI 自動偵測問題、與本機忽略路徑的衝突、審查前後快照比對（含 `.git/` 設定與 hooks）、`--reviewers` 篩選、中文與 shell 特殊字元，以及測試逾時清理子行程樹。v0.2.0 已在 T3 v0.1.12 完成真實模型端到端實測（`--builder claude --reviewers neon`），涵蓋 `.git/` 中繼資料快照比對、主目錄有未提交修改時的合併拒絕與修復後透過 `review-loop-cli.mjs merge --run` 自動偵測並重試成功。 |
+| Windows | 本機 31 項測試全部通過，涵蓋 Git 中繼資料與連結 hook 目標的審查比對、驗證失敗、ref transaction 合併與重試。v0.2.0 最後一輪審查修正前，曾在 T3 v0.1.12 用 Claude 和 Antigravity 實測，確認有未提交修改時會拒絕合併，修好 checkout 後可用同一條 CLI 指令重試成功。 |
 | macOS 與 Linux | 啟動器支援 T3 執行檔與安裝 launcher，測試逾時以 POSIX 行程群組清理。尚待在 macOS 與 Linux 實機驗證。 |
 
 執行 `npm test` 或 `node --test` 可跑本機測試套件。測試會在臨時 repo 執行真正的 Git 操作，但以替代品模擬 T3 與 `Schema` 及模型輸出；修改 `workflows/review-loop.js` 後請實際載入 T3 確認。

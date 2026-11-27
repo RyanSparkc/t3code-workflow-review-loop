@@ -365,11 +365,15 @@ test("advancing the target immediately before the ref transaction leaves its new
 
   const { result } = await evaluate(workflow, { project, task: "Update answer" }, {
     agent: (event) => event.name === "build" ? build(event) : { value: accepted },
-    ask: (event) => ({ _tag: "Some", value: { choice: event.name === "approve-merge" ? "Merge" : "Leave on branch" } }),
+    ask: (event) => {
+      assert.equal(event.name, "approve-merge", "Must not re-ask after ref-transaction branch movement");
+      return { _tag: "Some", value: { choice: "Merge" } };
+    },
   });
   assert.ok(newTarget);
   assert.notEqual(newTarget, base);
   assert.equal(result.merged, false);
+  assert.match(result.reason, /git merge --no-ff/);
   assert.equal(git(project, "rev-parse", "main"), newTarget);
   assert.equal(await readFile(join(project, "answer.txt"), "utf8"), "1");
   assert.equal(git(project, "status", "--porcelain"), "");
@@ -687,9 +691,7 @@ test("reviewers option runs only selected agents and validates invalid selection
   assert.match(empty.result.stopped, /Choose 1 or 2 reviewers/);
 });
 
-// ---- v0.2.0 tests: E (merge retry + CLI), F (.git metadata snapshot), H (missing paths) ----
-
-test("E: retryable merge refusal prompts Retry merge and succeeds once checkout is fixed", async (t) => {
+test("retryable merge refusal prompts Retry merge and succeeds once checkout is fixed", async (t) => {
   const { project, base, build } = await repo(t);
   const { default: workflow } = await loadWorkflow();
   const asked = [];
@@ -719,7 +721,7 @@ test("E: retryable merge refusal prompts Retry merge and succeeds once checkout 
   );
 });
 
-test("E: retryable merge stops after 3 attempts and non-retryable refusal does not re-ask", async (t) => {
+test("retryable merge stops after 3 attempts and non-retryable branch movement does not re-ask", async (t) => {
   // Case 1: exhausted 3 retryable merge attempts.
   const first = await repo(t);
   const { default: workflow } = await loadWorkflow();
@@ -751,9 +753,26 @@ test("E: retryable merge stops after 3 attempts and non-retryable refusal does n
   assert.match(moved.result.reason, /base branch moved/);
   assert.match(moved.result.reason, /git merge --no-ff/);
   assert.deepEqual(askNames2, ["approve-merge"]);
+
+  // Case 3: non-retryable refusal (source branch moved) must NOT ask approve-merge-2.
+  const third = await repo(t);
+  const askNames3 = [];
+  const sourceMoved = await evaluate(workflow, { project: third.project, task: "Update answer" }, {
+    agent: (event) => event.name === "build" ? third.build(event) : { value: accepted },
+    ask: async (event) => {
+      askNames3.push(event.name);
+      await writeFile(join(third.checkout, "answer.txt"), "3");
+      git(third.checkout, "commit", "-am", "Moved source");
+      return { _tag: "Some", value: { choice: "Merge" } };
+    },
+  });
+  assert.equal(sourceMoved.result.merged, false);
+  assert.match(sourceMoved.result.reason, /source branch moved/);
+  assert.match(sourceMoved.result.reason, /git log main\.\./);
+  assert.deepEqual(askNames3, ["approve-merge"]);
 });
 
-test("E: CLI resolveMergeSignal picks initial or retry question and rejects non-waiting runs", () => {
+test("CLI resolveMergeSignal picks initial or retry question, validates --wait, and rejects non-waiting runs", () => {
   const initialShow = {
     run: { runId: "r1", status: "waiting" },
     steps: [{ name: "approve-merge", kind: "ask", status: "running" }],
@@ -779,12 +798,17 @@ test("E: CLI resolveMergeSignal picks initial or retry question and rejects non-
   ]);
 
   assert.throws(
+    () => invocation(["merge", "--run", "r1", "--wait", "bogus"]),
+    /--wait must be approve-merge/,
+  );
+
+  assert.throws(
     () => resolveMergeSignal({ run: { runId: "r1", status: "completed" }, steps: [] }, "merge"),
     /not waiting on a merge question/,
   );
 });
 
-test("F: review stops when .git/config, hooks, or info/exclude change, but ignores refs/t3 checkpoints", async (t) => {
+test("review stops when Git metadata changes (.git/config, hooks, info/exclude, info/attributes, core.hooksPath, config.worktree, or symlinked hook target), while ignoring refs/t3 checkpoints", async (t) => {
   const { default: workflow } = await loadWorkflow();
 
   // 1. .git/config tampered during review
@@ -824,7 +848,72 @@ test("F: review stops when .git/config, hooks, or info/exclude change, but ignor
   });
   assert.match(excludeRes.result.stopped, /Git metadata/);
 
-  // 4. Control: T3 checkpoint ref under refs/t3/ must NOT cause a false positive
+  // 4. .git/info/attributes tampered during review
+  const attrRepo = await repo(t);
+  const attrRes = await evaluate(workflow, { project: attrRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return attrRepo.build(event);
+      await fsPromises.mkdir(join(attrRepo.project, ".git", "info"), { recursive: true });
+      await writeFile(join(attrRepo.project, ".git", "info", "attributes"), "*.txt -diff\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when .git/info/attributes changes"),
+  });
+  assert.match(attrRes.result.stopped, /Git metadata/);
+
+  // 5. Configured core.hooksPath modified during review
+  const hooksPathRepo = await repo(t);
+  const customHooksDir = join(hooksPathRepo.project, "..", "custom-hooks");
+  await fsPromises.mkdir(customHooksDir, { recursive: true });
+  git(hooksPathRepo.project, "config", "core.hooksPath", customHooksDir);
+  const hooksPathRes = await evaluate(workflow, { project: hooksPathRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return hooksPathRepo.build(event);
+      await writeFile(join(customHooksDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when core.hooksPath directory changes"),
+  });
+  assert.match(hooksPathRes.result.stopped, /Git metadata/);
+
+  // 6. Main-worktree .git/config.worktree modified during review
+  const wtCfgRepo = await repo(t);
+  git(wtCfgRepo.project, "config", "extensions.worktreeConfig", "true");
+  const wtCfgRes = await evaluate(workflow, { project: wtCfgRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return wtCfgRepo.build(event);
+      await writeFile(join(wtCfgRepo.project, ".git", "config.worktree"), "[core]\n\tfsmonitor = evil\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when main-worktree config.worktree changes"),
+  });
+  assert.match(wtCfgRes.result.stopped, /Git metadata/);
+
+  // 7. Pre-existing symlinked hook whose target file content changes during review
+  const symRepo = await repo(t);
+  const externalHooksDir = join(symRepo.project, "..", "external-hooks");
+  const externalHookTarget = join(externalHooksDir, "pre-commit");
+  await fsPromises.mkdir(externalHooksDir);
+  await writeFile(externalHookTarget, "#!/bin/sh\nexit 0\n");
+  if (process.platform === "win32") {
+    // Windows junctions exercise link traversal without requiring elevated symlink privileges.
+    const hooksLink = join(symRepo.project, ".git", "linked-hooks");
+    await fsPromises.symlink(externalHooksDir, hooksLink, "junction");
+    git(symRepo.project, "config", "core.hooksPath", hooksLink);
+  } else {
+    await fsPromises.symlink(externalHookTarget, join(symRepo.project, ".git", "hooks", "pre-commit"));
+  }
+  const symRes = await evaluate(workflow, { project: symRepo.project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return symRepo.build(event);
+      await writeFile(externalHookTarget, "#!/bin/sh\necho changed-hook\n");
+      return { value: accepted };
+    },
+    ask: () => assert.fail("Must stop when linked hook target content changes"),
+  });
+  assert.match(symRes.result.stopped, /Git metadata/);
+
+  // 8. Control: T3 checkpoint ref under refs/t3/ must NOT cause a false positive
   const t3Repo = await repo(t);
   const t3Res = await evaluate(workflow, { project: t3Repo.project, task: "Update answer" }, {
     agent: async (event) => {
@@ -838,7 +927,7 @@ test("F: review stops when .git/config, hooks, or info/exclude change, but ignor
   assert.equal(t3Res.result.reason, "Left on branch.");
 });
 
-test("H1: exhausting maxRounds without approval stops and preserves the branch", async (t) => {
+test("exhausting maxRounds without approval stops and preserves the branch", async (t) => {
   const { project, checkout, build } = await repo(t);
   const { default: workflow } = await loadWorkflow();
   const { result, events } = await evaluate(workflow, { project, task: "Update answer", maxRounds: 2 }, {
@@ -859,10 +948,10 @@ test("H1: exhausting maxRounds without approval stops and preserves the branch",
   ]);
 });
 
-test("H2: verification failures (0 commits, dirty worktree, failing test) skip reviewers and return to builder", async (t) => {
+test("verification failures (0 commits, branch behind base, missing worktree, dirty worktree, failing testCommand) skip reviewers and return to builder", async (t) => {
   const { default: workflow } = await loadWorkflow();
 
-  // Case a: 0 commits on build -> skips review-1 -> builder commits in revise-1 -> succeeds in round 2
+  // Case 1: 0 commits on build -> skips review-1 -> builder commits in revise-1 -> succeeds in round 2
   const zeroRepo = await repo(t);
   const zeroBriefs = [];
   const zeroRes = await evaluate(workflow, { project: zeroRepo.project, task: "Update answer", maxRounds: 2 }, {
@@ -886,7 +975,78 @@ test("H2: verification failures (0 commits, dirty worktree, failing test) skip r
   assert.match(zeroBriefs[0], /\[workflow\] Commit your changes/);
   assert.equal(zeroRes.events.some((e) => e.type === "agent" && e.name.startsWith("review-1-")), false);
 
-  // Case b: dirty worktree + failing test command both skip reviewers
+  // Case 2: branch behind base (merge-base mismatch) -> skips review-1 -> rebases in revise-1 -> succeeds in round 2
+  const behindRepo = await repo(t);
+  let behindBrief = "";
+  const behindRes = await evaluate(workflow, { project: behindRepo.project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        const built = await behindRepo.build(event);
+        git(behindRepo.project, "commit", "--allow-empty", "-m", "Base advanced");
+        return built;
+      }
+      if (event.name === "revise-1") {
+        behindBrief = event.options.brief;
+        git(behindRepo.checkout, "rebase", "main");
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(behindRes.result.rounds, 2);
+  assert.match(behindBrief, /\[workflow\] Rebase /);
+  assert.equal(behindRes.events.some((e) => e.type === "agent" && e.name.startsWith("review-1-")), false);
+
+  // Case 3: missing worktree -> skips review-1 -> restores worktree in revise-1 -> succeeds in round 2
+  const missingWtRepo = await repo(t);
+  let missingWtBranch = "";
+  let missingWtBrief = "";
+  const missingWtRes = await evaluate(workflow, { project: missingWtRepo.project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        missingWtBranch = event.options.workspace.branch;
+        const built = await missingWtRepo.build(event);
+        git(missingWtRepo.project, "worktree", "remove", "--force", missingWtRepo.checkout);
+        return built;
+      }
+      if (event.name === "revise-1") {
+        missingWtBrief = event.options.brief;
+        git(missingWtRepo.project, "worktree", "add", missingWtRepo.checkout, missingWtBranch);
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(missingWtRes.result.rounds, 2);
+  assert.match(missingWtBrief, /\[workflow\] Restore the builder worktree/);
+  assert.equal(missingWtRes.events.some((e) => e.type === "agent" && e.name.startsWith("review-1-")), false);
+
+  // Case 4: dirty worktree -> skips review-1 -> cleans worktree in revise-1 -> succeeds in round 2
+  const dirtyRepo = await repo(t);
+  let dirtyBrief = "";
+  const dirtyRes = await evaluate(workflow, { project: dirtyRepo.project, task: "Update answer", maxRounds: 2 }, {
+    agent: async (event) => {
+      if (event.name === "build") {
+        const built = await dirtyRepo.build(event);
+        await writeFile(join(dirtyRepo.checkout, "uncommitted.txt"), "leftover");
+        return built;
+      }
+      if (event.name === "revise-1") {
+        dirtyBrief = event.options.brief;
+        await rm(join(dirtyRepo.checkout, "uncommitted.txt"));
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return { value: accepted };
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Leave on branch" } }),
+  });
+  assert.equal(dirtyRes.result.rounds, 2);
+  assert.match(dirtyBrief, /\[workflow\] Commit the deliverable/);
+  assert.equal(dirtyRes.events.some((e) => e.type === "agent" && e.name.startsWith("review-1-")), false);
+
+  // Case 5: failing testCommand -> skips reviewers and stops when maxRounds is exhausted
   const failRepo = await repo(t);
   let failBrief = "";
   const failRes = await evaluate(workflow, {
@@ -910,7 +1070,7 @@ test("H2: verification failures (0 commits, dirty worktree, failing test) skip r
   assert.match(failRes.result.stopped, /No approval after 2 rounds/);
 });
 
-test("H3: builder self-reported test failure skips reviewers unless testCommandRun is none", async (t) => {
+test("builder self-reported test failure skips reviewers unless testCommandRun is none", async (t) => {
   const { default: workflow } = await loadWorkflow();
 
   // Reported failing check with no fixed --test -> skips review-1 -> revises -> passes round 2
@@ -950,7 +1110,7 @@ test("H3: builder self-reported test failure skips reviewers unless testCommandR
   assert.equal(res2.events.some((e) => e.type === "agent" && e.name === "review-1-claude"), true);
 });
 
-test("H4: merge replay recovers an already-committed reviewed merge commit", async (t) => {
+test("merge replay recovers an already-committed reviewed merge commit", async (t) => {
   const { project, checkout, base, build } = await repo(t);
   const { default: workflow } = await loadWorkflow();
   let precommitted = "";

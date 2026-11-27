@@ -49,10 +49,15 @@ const commands = new Map([
   ["leave", { run: string, wait: string }],
 ]);
 
+const WAIT_NAME_RE = /^approve-merge(?:-\d+)?$/;
+
+function mergeChoiceForWait(command, waitName) {
+  if (command !== "merge") return "Leave on branch";
+  return waitName === "approve-merge" ? "Merge" : "Retry merge";
+}
+
 export function signalArgs(command, runId, waitName = "approve-merge") {
-  const choice = command === "merge"
-    ? (waitName === "approve-merge" ? "Merge" : "Retry merge")
-    : "Leave on branch";
+  const choice = mergeChoiceForWait(command, waitName);
   return ["workflow", "signal", JSON.stringify({ choice }), "--run", runId, "--wait", waitName];
 }
 
@@ -61,14 +66,11 @@ export function resolveMergeSignal(showData, command) {
   const openAsk = [...steps].reverse().find((item) =>
     item?.kind === "ask" &&
     (item.status === "running" || item.status === "waiting") &&
-    /^approve-merge(?:-\d+)?$/.test(String(item.name || "")),
+    WAIT_NAME_RE.test(String(item.name || "")),
   );
   if (openAsk) {
     const wait = String(openAsk.name);
-    const choice = command === "merge"
-      ? (wait === "approve-merge" ? "Merge" : "Retry merge")
-      : "Leave on branch";
-    return { wait, choice };
+    return { wait, choice: mergeChoiceForWait(command, wait) };
   }
   const status = showData?.run?.status || "unknown";
   throw new Error(
@@ -125,8 +127,8 @@ export function invocation(argv) {
     if (command === "show") t3Args.push(runId);
     else {
       const wait = values.wait?.trim();
-      if (values.wait !== undefined && (!wait || wait.startsWith("-"))) {
-        throw new Error("--wait must be a T3 workflow question name.");
+      if (values.wait !== undefined && !WAIT_NAME_RE.test(wait || "")) {
+        throw new Error("--wait must be approve-merge or approve-merge-N (e.g. approve-merge-2).");
       }
       const waitName = wait || "approve-merge";
       t3Args = signalArgs(command, runId, waitName);
@@ -300,7 +302,12 @@ async function main(argv) {
   const target = findT3(request.explicitPath);
   let t3Args = request.t3Args;
   if (request.signal && !request.signal.explicitWait) {
-    const raw = await capture(target, ["workflow", "show", request.signal.runId, "--json"]);
+    let raw;
+    try {
+      raw = await capture(target, ["workflow", "show", request.signal.runId, "--json"]);
+    } catch (error) {
+      throw new Error(error.message + " Pass --wait NAME explicitly if the run is waiting on a merge question.");
+    }
     let showData;
     try {
       showData = JSON.parse(raw);
@@ -308,7 +315,10 @@ async function main(argv) {
       throw new Error("Could not parse JSON from `t3 workflow show --json`. Pass --wait NAME explicitly.");
     }
     const resolved = resolveMergeSignal(showData, request.signal.command);
-    t3Args = signalArgs(request.signal.command, request.signal.runId, resolved.wait);
+    t3Args = [
+      "workflow", "signal", JSON.stringify({ choice: resolved.choice }),
+      "--run", request.signal.runId, "--wait", resolved.wait,
+    ];
   }
   const child = launch(target, t3Args);
   return new Promise((resolve, reject) => {
