@@ -4,19 +4,10 @@
 
 給 [T3 Code](https://github.com/pingdotgg/t3code) 使用的多模型開發與審查工作流程，適用於任何本機 Git 專案。由一個模型在獨立 Git worktree 實作並跑測試，再交給另外一到兩個模型審查同一個驗證過的 commit；需要修改時回到原本的 builder thread，全部通過後由你決定要本機合併或保留分支。整個流程不會執行 `git push`。
 
-```mermaid
-flowchart LR
-    A[任務與驗收條件] --> B[在 worktree 實作]
-    B --> C[驗證 commit 與執行測試]
-    C -->|通過| D[1 到 2 位唯讀 reviewer]
-    C -->|失敗| F[回原 builder thread 修正]
-    D -->|要求修正| F
-    D -->|審查期間 checkout 被改動| X[停止 run]
-    F --> C
-    D -->|核准| E{由你決定}
-    E --> G[本機合併]
-    E --> H[保留分支]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/workflow-dark-zh.png">
+  <img src=".github/workflow-light-zh.png" width="100%" alt="流程：含驗收條件的任務交給 builder，在獨立的 Git worktree 實作。workflow 以程式驗證 commit 並執行測試，接著由 1 到 2 個唯讀模型審查。所有審查通過後，由你決定本機合併審過的 commit 或保留分支。驗證未通過或審查要求修正時，回到原本的 builder thread 修正後重新驗證。審查期間 checkout 被改動時，run 會停止。整個流程不會執行 git push。">
+</picture>
 
 ## 快速開始
 

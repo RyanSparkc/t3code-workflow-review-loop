@@ -4,19 +4,10 @@
 
 A durable [T3 Code](https://github.com/pingdotgg/t3code) workflow for multi-model development on any Git repository. One model builds and tests in an isolated Git worktree, one or two other models review the exact verified commit, revisions return to the original builder thread, and you decide whether to merge locally or keep the branch. The workflow never pushes.
 
-```mermaid
-flowchart LR
-    A[Task and acceptance criteria] --> B[Build in a worktree]
-    B --> C[Verify commit and run tests]
-    C -->|Pass| D[1 or 2 read-only reviewers]
-    C -->|Fail| F[Revise in the same builder thread]
-    D -->|Changes requested| F
-    D -->|Checkout changed during review| X[Stop the run]
-    F --> C
-    D -->|Approved| E{Your decision}
-    E --> G[Merge locally]
-    E --> H[Keep the branch]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/workflow-dark-en.png">
+  <img src=".github/workflow-light-en.png" width="100%" alt="Workflow: a task with acceptance criteria goes to the builder, which works in its own Git worktree. The workflow verifies the commits and runs the tests in code, then one or two read-only models review. After every review passes, you decide to merge the reviewed commit locally or keep the branch. Failed checks and requested changes go back to the same builder thread for revision and verification. If the checkout changes during review, the run stops. The workflow never runs git push.">
+</picture>
 
 ## Quick start
 
