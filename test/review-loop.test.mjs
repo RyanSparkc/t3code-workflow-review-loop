@@ -428,6 +428,106 @@ test("a merge that would replace an ignored local file leaves the checkout intac
   assert.equal(git(project, "status", "--porcelain"), "");
 });
 
+// Builds a branch that adds `files` (forced past ignore rules) and answers Merge.
+async function mergeWithAddedFiles(t, setupLocal, files) {
+  const { project, checkout, base, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  await setupLocal(project);
+  const { result } = await evaluate(workflow, { project, task: "Update answer and add files" }, {
+    agent: async (event) => {
+      if (event.name !== "build") return { value: accepted };
+      const built = await build(event);
+      for (const [path, content] of Object.entries(files)) {
+        await fsPromises.mkdir(join(checkout, path, ".."), { recursive: true });
+        await writeFile(join(checkout, path), content);
+        git(checkout, "add", "-f", path);
+      }
+      git(checkout, "commit", "-m", "Add files");
+      return built;
+    },
+    ask: () => ({ _tag: "Some", value: { choice: "Merge" } }),
+  });
+  return { project, base, result };
+}
+
+test("an added path that collides with a local ignored folder or file refuses the merge", async (t) => {
+  // The branch adds a file where an ignored folder exists locally.
+  const folder = await mergeWithAddedFiles(t, async (project) => {
+    await writeFile(join(project, ".git", "info", "exclude"), "cache/\n");
+    await fsPromises.mkdir(join(project, "cache"));
+    await writeFile(join(project, "cache", "local.txt"), "local cache");
+  }, { cache: "tracked file" });
+  assert.equal(folder.result.merged, false);
+  assert.match(folder.result.reason, /overwrite a local untracked or ignored path: cache$/m);
+  assert.equal(git(folder.project, "rev-parse", "main"), folder.base);
+  assert.equal(await readFile(join(folder.project, "cache", "local.txt"), "utf8"), "local cache");
+
+  // The branch adds a file under a path that is an ignored file locally.
+  const parent = await mergeWithAddedFiles(t, async (project) => {
+    await writeFile(join(project, ".git", "info", "exclude"), "out\n");
+    await writeFile(join(project, "out"), "local output");
+  }, { "out/result.txt": "tracked result" });
+  assert.equal(parent.result.merged, false);
+  assert.match(parent.result.reason, /overwrite a local untracked or ignored path: out$/m);
+  assert.equal(await readFile(join(parent.project, "out"), "utf8"), "local output");
+});
+
+test("ignored folders that the merge does not overwrite stay untouched and do not block it", async (t) => {
+  const { project, result } = await mergeWithAddedFiles(t, async (project) => {
+    await writeFile(join(project, ".git", "info", "exclude"), "node_modules/\ncache/\n");
+    for (let i = 0; i < 200; i++) {
+      await fsPromises.mkdir(join(project, "node_modules", "pkg" + i), { recursive: true });
+      await writeFile(join(project, "node_modules", "pkg" + i, "index.js"), "module " + i);
+    }
+    await fsPromises.mkdir(join(project, "cache"));
+    await writeFile(join(project, "cache", "local.txt"), "local cache");
+  }, { "src/new.txt": "new source", "cache/tracked.txt": "new tracked file inside an ignored folder" });
+  assert.equal(result.merged, true, result.reason);
+  assert.equal(await readFile(join(project, "src", "new.txt"), "utf8"), "new source");
+  assert.equal(await readFile(join(project, "cache", "tracked.txt"), "utf8"), "new tracked file inside an ignored folder");
+  assert.equal(await readFile(join(project, "cache", "local.txt"), "utf8"), "local cache");
+  assert.equal(await readFile(join(project, "node_modules", "pkg199", "index.js"), "utf8"), "module 199");
+});
+
+test("a test command that detaches HEAD is reported as a changed checkout", async (t) => {
+  const { project, checkout, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  let reviseBrief = "";
+  const { result } = await evaluate(workflow, {
+    project, task: "Update answer", testCommand: "git checkout --quiet --detach", maxRounds: 2,
+  }, {
+    agent: async (event) => {
+      if (event.name === "build") return build(event);
+      if (event.name === "revise-1") {
+        reviseBrief = event.options.brief;
+        // Reattach the worktree; the next verification detaches it again.
+        git(checkout, "checkout", "--quiet", event.options.brief.match(/on (review-loop\/\S+) and/)[1]);
+        return { thread: "original-builder", value: buildOutput };
+      }
+      return assert.fail("Reviewers must not run while verification fails: " + event.name);
+    },
+    ask: () => assert.fail("A run with a failing verification must not reach the merge question"),
+  });
+  assert.match(reviseBrief, /\[workflow\] The test changed the checkout/);
+  assert.doesNotMatch(reviseBrief, /symbolic-ref/);
+  assert.match(result.stopped, /No approval after 2 rounds/);
+});
+
+test("blank entries in an approving review's problems do not trigger a revision", async (t) => {
+  const { project, build } = await repo(t);
+  const { default: workflow } = await loadWorkflow();
+  let asked = false;
+  const { events } = await evaluate(workflow, { project, task: "Update answer" }, {
+    agent: async (event) => {
+      if (event.name === "build") return build(event);
+      return { value: { ...accepted, problems: ["", "   "] } };
+    },
+    ask: () => { asked = true; return { _tag: "Some", value: { choice: "Leave on branch" } }; },
+  });
+  assert.equal(asked, true);
+  assert.equal(events.some((e) => e.type === "agent" && e.name.startsWith("revise-")), false);
+});
+
 test("preflight preserves permission errors while resolving the project folder", async (t) => {
   const project = await temp(t);
   const { default: workflow } = await loadWorkflow();

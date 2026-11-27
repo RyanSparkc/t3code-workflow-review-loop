@@ -1,6 +1,6 @@
 {
   "name": "t3code-workflow-review-loop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "T3 Code workflow: one model builds in a Git worktree, one or two other models review the exact commit, and you decide whether to merge locally.",
   "author": "RyanSparkc",
