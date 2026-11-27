@@ -1,7 +1,7 @@
 // T3 Code Workflows (Labs). Configure the agent pool before installing this file.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -267,7 +267,8 @@ async function verify(project, base, branch, command) {
       result.testRan = true;
       result.testOutputTail = test.outputTail;
       if (!test.passed) result.issues.push("Workflow test failed:\n" + test.outputTail);
-      const checkedOutBranch = await readGit(checkout, ["symbolic-ref", "--quiet", "HEAD"]);
+      // checkoutRef returns "" for a detached HEAD instead of throwing.
+      const checkedOutBranch = await checkoutRef(checkout);
       const checkedOutSha = await readGit(checkout, ["rev-parse", "HEAD"]);
       if (checkedOutBranch !== ref(branch) || checkedOutSha !== result.headSha ||
           await readGit(checkout, ["status", "--porcelain", "--untracked-files=all"])) {
@@ -310,21 +311,41 @@ function snapshotChanges(before, after) {
   return changes;
 }
 
-async function updateCheckout(project, from, to) {
-  const added = await git(project, ["diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", from, to, "--"]);
-  if (added) {
-    // read-tree can overwrite ignored files, unlike the previous merge with
-    // --no-overwrite-ignore. Check both file and directory collisions first.
-    const ignored = await git(project, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]);
-    if (ignored) {
-      const ignoreCase = await readGit(project, ["config", "--type=bool", "--default=false", "--get", "core.ignoreCase"]);
-      const paths = (output) => (ignoreCase === "true" ? output.toLowerCase() : output).split("\0").filter(Boolean);
-      const additions = paths(added);
-      const collision = paths(ignored).find((local) => additions.some((path) =>
-        path === local || path.startsWith(local + "/") || local.startsWith(path + "/")));
-      if (collision) throw new Error("Merging would overwrite an ignored local file: " + collision);
-    }
+async function pathEntry(file) {
+  try {
+    return await lstat(file);
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+    throw error;
   }
+}
+
+// read-tree can overwrite ignored files, unlike `git merge --no-overwrite-ignore`.
+// Check only the paths the merge adds, instead of listing every ignored file:
+// a large ignored tree such as node_modules/ would be slow to list and could
+// exceed the git output buffer. A collision is an added path that already
+// exists locally, or one of its parent folders that exists as a file. The
+// filesystem applies its own case rules, so no core.ignoreCase handling is needed.
+async function localCollision(project, added) {
+  for (const path of added) {
+    const parts = path.split("/");
+    let parentsAreFolders = true;
+    for (let depth = 1; depth < parts.length && parentsAreFolders; depth++) {
+      const parent = parts.slice(0, depth).join("/");
+      const entry = await pathEntry(join(project, parent));
+      if (!entry) parentsAreFolders = false;
+      else if (!entry.isDirectory()) return parent;
+    }
+    if (parentsAreFolders && await pathEntry(join(project, path))) return path;
+  }
+  return "";
+}
+
+async function updateCheckout(project, from, to) {
+  const added = (await git(project, ["diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", from, to, "--"]))
+    .split("\0").filter(Boolean);
+  const collision = await localCollision(project, added);
+  if (collision) throw new Error("Merging would overwrite a local untracked or ignored path: " + collision);
   await git(project, ["read-tree", "-m", "-u", from, to]);
 }
 
@@ -599,8 +620,10 @@ export default workflow(
           );
         }
         reviews.forEach(({ value }, index) => {
-          if (value.approved && value.problems.length === 0) return;
-          const findings = value.problems.length ? value.problems : [value.summary || "Rejected without details."];
+          // Blank entries carry no finding, so they must not block an approval.
+          const listed = value.problems.map((problem) => problem.trim()).filter(Boolean);
+          if (value.approved && listed.length === 0) return;
+          const findings = listed.length ? listed : [value.summary || "Rejected without details."];
           problems.push(...findings.map((finding) => "[" + reviewers[index] + "] " + finding));
         });
       }
