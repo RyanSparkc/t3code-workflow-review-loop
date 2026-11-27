@@ -104,7 +104,7 @@ Use the filename printed by `npm pack` if it differs. The installed command is a
 review-loop start --project . --task-file task.md --test "npm test"
 ```
 
-Use `--task-file` for multiline tasks or text with shell metacharacters, especially in Windows Command Prompt. For complex `--test` shell commands on Windows, use PowerShell or the direct Node launcher. If PowerShell blocks npm's `.ps1` launcher, use the direct Node launcher or `review-loop.cmd` with `--task-file` and a simple test command.
+Use `--task-file` for multiline tasks or text with shell metacharacters. Windows Command Prompt still expands `%NAME%` in quoted paths, so use PowerShell for paths containing that pattern or for complex `--test` commands. If PowerShell blocks npm's `.ps1` launcher, call the direct Node launcher from PowerShell. `review-loop.cmd` also works with ordinary paths, `--task-file`, and simple test commands.
 
 ### Optional agent Skill
 

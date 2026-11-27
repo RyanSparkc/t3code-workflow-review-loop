@@ -104,7 +104,7 @@ review-loop --help
 review-loop start --project . --task-file task.md --test "npm test"
 ```
 
-多行需求或含有 shell 特殊字元的內容請用 `--task-file`，尤其是在 Windows 命令提示字元中。`--test` 若是複雜的 shell 指令，請用 PowerShell 或直接用 Node 啟動器。如果 PowerShell 的執行原則擋住 npm 產生的 `.ps1`，可用 Node 啟動器，或用 `review-loop.cmd` 搭配 `--task-file` 和簡單的測試指令。
+多行需求或含有 shell 特殊字元的內容請用 `--task-file`。Windows 命令提示字元即使看到加了引號的路徑，仍會展開其中的 `%NAME%`。遇到這類路徑或複雜的 `--test` 指令時，請改用 PowerShell。如果 PowerShell 的執行原則擋住 npm 產生的 `.ps1`，可在 PowerShell 裡直接用 Node 啟動器。一般路徑搭配 `--task-file` 和簡單的測試指令，也可使用 `review-loop.cmd`。
 
 ### 選用 Agent Skill
 
